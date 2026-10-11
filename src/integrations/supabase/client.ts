@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
-import { getStaffToken } from '@/lib/session';
+import { ensureStaffToken } from '@/lib/neonAuth';
 
 /**
  * Neon Data API (PostgREST-compatible) client.
@@ -100,8 +100,9 @@ function createNeonFetch(publishableKey: string): typeof fetch {
       new Headers(init.headers).forEach((value, key) => headers.set(key, value));
     }
 
-    const staffToken = getStaffToken();
-    const token = staffToken ?? await resolveGuestToken();
+    // Re-mint when the stored JWT has aged out (it lives 15 minutes) so a tab
+    // left open keeps working instead of every request failing with a 401.
+    const token = (await ensureStaffToken()) ?? await resolveGuestToken();
     const url = requestUrl(input);
 
     if (token) {
@@ -296,6 +297,32 @@ function functionUrl(name: string): string | null {
   return `${FUNCTIONS_BASE.replace(/\/$/, '')}-${slug}.compute.${FUNCTIONS_CELL}`;
 }
 
+/**
+ * Turn a failed function response into a message a person can act on.
+ *
+ * The functions answer with `{ error, detail }`, not `{ message }`, so reading
+ * only `message` collapsed every failure to a bare status number — a refused
+ * call looked like "failed (401)" instead of "Staff sign-in required", which is
+ * indistinguishable from a bug to whoever is looking at it.
+ */
+function functionErrorMessage(name: string, status: number, data: unknown): string {
+  const body = (data && typeof data === 'object' ? data : {}) as {
+    message?: string;
+    error?: string;
+    detail?: string;
+    code?: string;
+  };
+  const text = body.message || body.error;
+  if (text) return body.detail ? `${text} ${body.detail}` : text;
+
+  // An auth refusal means the stored session is gone or expired. Say so rather
+  // than reporting a status code, so the fix (sign in again) is obvious.
+  if (status === 401 || body.code === 'staff_token_missing' || body.code === 'staff_token_invalid') {
+    return 'Your session has expired. Please sign in again.';
+  }
+  return `Function "${name}" failed (${status}).`;
+}
+
 function shimFunctions() {
   return {
     async invoke(name: string, opts?: { body?: unknown; method?: string; headers?: HeadersInit }) {
@@ -316,7 +343,7 @@ function shimFunctions() {
         // refused with a 401 that looks like an expired session.
         const headers = new Headers({ 'Content-Type': 'application/json' });
         new Headers(opts?.headers || {}).forEach((value, key) => headers.set(key, value));
-        const token = getStaffToken() ?? await resolveGuestToken();
+        const token = (await ensureStaffToken()) ?? await resolveGuestToken();
         if (token) headers.set('Authorization', `Bearer ${token}`);
 
         const res = await fetch(url, {
@@ -328,7 +355,7 @@ function shimFunctions() {
         let data: unknown = null;
         try { data = JSON.parse(text); } catch { data = text; }
         if (!res.ok) {
-          return { data, error: { message: (data as { message?: string })?.message || `Function "${name}" failed (${res.status})` } };
+          return { data, error: { message: functionErrorMessage(name, res.status, data) } };
         }
         return { data, error: null };
       } catch (e) {

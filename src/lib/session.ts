@@ -17,6 +17,49 @@ export interface StaffSession {
   expiresAt: number;
 }
 
+/**
+ * Read a JWT's `exp` without verifying it.
+ *
+ * The minted token lives 15 minutes while the session itself survives days, so
+ * `expiresAt` above says nothing about whether `token` still works. Decoding
+ * `exp` lets a caller re-mint *before* a request is sent instead of discovering
+ * the staleness afterwards as an unexplained 401.
+ */
+export const staffTokenExpiry = (token?: string): number | null => {
+  if (!token) return null;
+  try {
+    const part = token.split('.')[1];
+    if (!part) return null;
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64.padEnd(Math.ceil(b64.length / 4) * 4, '=');
+    const claims = JSON.parse(atob(padded));
+    return typeof claims.exp === 'number' ? claims.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+};
+
+/** True when the stored JWT is absent or inside `skewMs` of expiring. */
+export const isStaffTokenExpired = (skewMs = 30_000): boolean => {
+  const exp = staffTokenExpiry(getStaffSession()?.token);
+  return exp === null || exp - skewMs <= Date.now();
+};
+
+/** Replace only the JWT in the stored session, preserving its 8h/7d lifetime. */
+export const setStaffToken = (token: string) => {
+  for (const store of [localStorage, sessionStorage]) {
+    try {
+      const raw = store.getItem(SESSION_KEY);
+      if (!raw) continue;
+      const session: StaffSession = JSON.parse(raw);
+      if (!session.expiresAt || session.expiresAt <= Date.now()) continue;
+      store.setItem(SESSION_KEY, JSON.stringify({ ...session, token }));
+    } catch {
+      // A corrupt entry is dropped by getStaffSession on its next read.
+    }
+  }
+};
+
 /** Read the staff session from localStorage (remembered) or sessionStorage */
 export const getStaffSession = (): StaffSession | null => {
   try {

@@ -14,6 +14,8 @@
  * app already expects.
  */
 
+import { getStaffToken, isStaffTokenExpired, setStaffToken } from './session';
+
 const AUTH_BASE = import.meta.env.VITE_NEON_AUTH_URL as string;
 
 /**
@@ -157,13 +159,51 @@ export async function neonSignIn(email: string, password: string): Promise<NeonL
 export async function neonSignOut(): Promise<void> {
   if (!AUTH_BASE) return;
   try {
-    const cookies = typeof document !== 'undefined'
-      ? document.cookie.split(';').map((c) => c.split('=')[0].trim())
-      : [];
-    const hasSession = cookies.some((c) => c.includes('session_token'));
-    if (!hasSession) return;
-    await fetch(authUrl('sign-out'), { method: 'POST', headers: authHeaders() });
+    // Always attempt the server-side sign-out. The Neon Auth session cookie is
+    // `__Secure-`/HttpOnly, so `document.cookie` cannot see it — a presence
+    // check there is permanently false and would skip revocation every time,
+    // leaving a valid 7-day server session behind after the user logs out.
+    await fetch(authUrl('sign-out'), { method: 'POST', headers: authHeaders(), credentials: 'include' });
   } catch {
     // Local session clearing is what actually gates the UI; ignore network errors.
   }
+}
+
+/**
+ * Mint a fresh Data API JWT from the still-live Neon Auth session cookie.
+ *
+ * `/token` issues a **15-minute** JWT, but the session cookie behind it lasts
+ * **7 days**. An app that mints only during sign-in therefore stops being able
+ * to talk to the database 15 minutes later, while the user is still visibly
+ * signed in — every request401s until they log in again. Re-minting here keeps
+ * a long-lived tab working without a re-login.
+ */
+export async function refreshStaffToken(): Promise<string | null> {
+  if (!AUTH_BASE) return null;
+  try {
+    const res = await fetch(authUrl('token'), { headers: authHeaders(), credentials: 'include' });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => ({}));
+    const token: string | undefined = body.token ?? body?.data?.token;
+    if (!token) return null;
+    setStaffToken(token);
+    return token;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The token a request should carry: the stored one when it is still valid,
+ * otherwise a newly minted one. Falls back to the stored token when minting
+ * fails, so the caller gets the server's own 401 rather than a silent empty
+ * header that would be indistinguishable from being signed out.
+ */
+export async function ensureStaffToken(): Promise<string | null> {
+  const current = getStaffToken();
+  // No stored staff session means this caller is a guest; minting would only
+  // send a request Neon Auth is guaranteed to refuse.
+  if (!current) return null;
+  if (!isStaffTokenExpired()) return current;
+  return (await refreshStaffToken()) ?? current;
 }
